@@ -1,0 +1,602 @@
+# نصب و بارگیری پکیج‌ها
+if (!require("terra")) install.packages("terra")
+if (!require("dplyr")) install.packages("dplyr")
+if (!require("tidyr")) install.packages("tidyr")
+if (!require("shiny")) install.packages("shiny")
+if (!require("tibble")) install.packages("tibble")
+if (!require("shinyFiles")) install.packages("shinyFiles")
+if (!require("gridExtra")) install.packages("gridExtra")
+if (!require("lattice")) install.packages("lattice")
+if (!require("rasterVis")) install.packages("rasterVis")
+if (!require("raster")) install.packages("raster")
+if (!require("grid")) install.packages("grid")
+
+library(terra)
+library(dplyr)
+library(tidyr)
+library(shiny)
+library(tibble)
+library(shinyFiles)
+library(gridExtra)
+library(lattice)
+library(rasterVis)
+library(raster)
+library(grid)
+
+# تابع محاسبه مجموع مقادیر رستر (یک‌بار خواندن)
+sum_raster <- function(raster_path) {
+  r <- rast(raster_path)
+  vals <- values(r)
+  if (all(is.na(vals))) {
+    warning("Raster at ", raster_path, " has no valid values!")
+    return(NA)
+  }
+  sum(vals[!is.na(vals)])
+}
+
+# تابع واسطه برای محاسبه واریانس؛ تضمین می‌کند خروجی همیشه یک اسکالر (تکی عدد) باشد.
+calc_variance <- function(x, ...) {
+  out <- if(length(x) < 2) NA_real_ else var(x, na.rm = TRUE)
+  return(as.numeric(out)[1])
+}
+
+# تابع محاسبه اطمینان؛ اکنون یک آرگومان conf_limit نیز دارد.
+calculate_confidence <- function(pixel_values_over_runs, conf_limit) {
+  valid_values <- pixel_values_over_runs[!is.na(pixel_values_over_runs)]
+  nval <- length(valid_values)
+  if (nval == 0) return(as.integer(NA))
+  
+  increase_runs <- sum(valid_values > 1e-9, na.rm = TRUE)
+  decrease_runs <- sum(valid_values < -1e-9, na.rm = TRUE)
+  
+  conf_increase <- increase_runs / nval
+  conf_decrease <- decrease_runs / nval
+  
+  if (conf_increase >= conf_limit) {
+    return(1L)
+  } else if (conf_decrease >= conf_limit) {
+    return(-1L)
+  } else {
+    return(0L)
+  }
+}
+
+# تابع تولید لایه‌های میانی برای مخازن کربن
+# خروجی‌ها به صورت مسیر فایل (رشته) ذخیره می‌شوند.
+generate_carbon_pool_maps <- function(lulc_path, carbon_pool_df, base_name, intermediate_dir, result_suffix, file_ext) {
+  outputs <- list()
+  pool_names <- c("above", "below", "soil", "dead")
+  
+  # خواندن رستر و محاسبه مساحت پیکسل (متر مربع)
+  lulc_raster <- rast(lulc_path)
+  dims <- res(lulc_raster)
+  pixel_area <- abs(dims[1] * dims[2])
+  
+  # تولید نقشه‌های میانی برای هر مخزن
+  for (pool in pool_names) {
+    pool_col <- paste0("c_", pool)
+    
+    mapping <- carbon_pool_df %>%
+      dplyr::select(LULC_code, !!sym(pool_col)) %>%
+      mutate(LULC_code = as.numeric(as.character(LULC_code))) %>%
+      mutate(value = !!sym(pool_col) * pixel_area / 10000) %>%  # تبدیل m² به ha
+      dplyr::select(LULC_code, value)
+    
+    rcl_matrix <- as.matrix(mapping)
+    out_file <- file.path(intermediate_dir, paste0(basename(base_name), "_", pool, result_suffix, file_ext))
+    classify(lulc_raster,
+             rcl = rcl_matrix,
+             filename = out_file, overwrite = TRUE, datatype = "FLT4S")
+    outputs[[pool]] <- out_file   # ذخیره مسیر فایل
+  }
+  
+  # محاسبه رستر total (جمع چهار مخزن) و ذخیره در پوشه‌ی پایه
+  total_raster <- rast(outputs$above) + rast(outputs$below) +
+    rast(outputs$soil) + rast(outputs$dead)
+  total_file <- file.path(dirname(intermediate_dir), paste0(basename(base_name), "_total", result_suffix, file_ext))
+  writeRaster(total_raster, filename = total_file, overwrite = TRUE, datatype = "FLT4S")
+  outputs[["total"]] <- total_file   # ذخیره مسیر فایل
+  return(outputs)
+}
+
+# تابع محاسبه ثابت ارزش‌گذاری (برای ذخیره شده‌ها)
+calculate_valuation_constant <- function(lulc_cur_year, lulc_fut_year, discount_rate, rate_change, price_per_metric_ton_of_c) {
+  n_years <- lulc_fut_year - lulc_cur_year
+  ratio <- 1 / ((1 + discount_rate / 100) * (1 + rate_change / 100))
+  valuation_constant <- (price_per_metric_ton_of_c / n_years)
+  
+  if (abs(ratio - 1) < 1e-6) {
+    return(valuation_constant * n_years)
+  } else {
+    return(valuation_constant * (1 - ratio ^ n_years) / (1 - ratio))
+  }
+}
+
+# تابع محاسبه ارزشگذاری برای کربن ذخیره شده (Stored Carbon)
+# در اینجا مقدار ارزش گذاری با ضرب رستر کربن در ثابت ارزش‌گذاری محاسبه می‌شود.
+calculate_valuation <- function(carbon_stock_path, valuation_constant, valuation_out_path) {
+  stock_raster <- rast(carbon_stock_path)
+  valuation_raster <- stock_raster * valuation_constant
+  writeRaster(valuation_raster, filename = valuation_out_path, overwrite = TRUE, datatype = "FLT4S")
+}
+
+# تابع تولید گزارش HTML شامل ورودی‌ها، نتایج تجمیعی و گزارش لایه‌های میانی
+generate_report <- function(raster_file_set, model_args, file_registry, valuation_constant) {
+  html_report_path <- file_registry$html_report
+  con <- file(html_report_path, open = "wt")
+  sink(con)
+  
+  cat("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Carbon Model Results</title>\n")
+  cat("<style type=\"text/css\">\n",
+      "body { --invest-green: #148f68; background: #ffffff; color: #000000; font-family: Roboto, 'Helvetica Neue', Arial, sans-serif; }\n",
+      "h1, h2, th { font-weight: bold; }\n",
+      "h1, h2 { color: var(--invest-green); }\n",
+      "h1 { font-size: 2rem; }\n",
+      "h2 { font-size: 1.5rem; }\n",
+      "table { border: 0.25rem solid var(--invest-green); border-collapse: collapse; margin-bottom: 1rem; }\n",
+      "thead tr { background: #e9ecef; border-bottom: 0.1875rem solid var(--invest-green); }\n",
+      "tbody tr:nth-child(even) { background: ghostwhite; }\n",
+      "th, td { padding: 0.5rem; text-align: left; }\n",
+      ".number { text-align: right; font-family: monospace; }\n",
+      "</style>\n</head>\n<body>\n")
+  
+  cat("<h1>InVEST Carbon Model Results</h1>\n")
+  cat("<p>This document summarizes the results from running the carbon model with the following inputs.</p>\n")
+  cat(paste0("<p>Report generated at ", format(Sys.time(), "%Y-%m-%d %H:%M"), "</p>\n"))
+  
+  cat("<h2>Inputs</h2>\n<table><thead><tr><th>Argument</th><th>Value</th></tr></thead><tbody>\n")
+  for (key in names(model_args)) {
+    cat(paste0("<tr><td>", key, "</td><td>", model_args[[key]], "</td></tr>\n"))
+  }
+  cat("</tbody></table>\n")
+  
+  cat("<h2>Aggregate Results</h2>\n<table><thead><tr><th>Description</th><th>Value</th><th>Units</th><th>Output File</th></tr></thead><tbody>\n")
+  
+  aggregate_results <- list(
+    list(raster_uri = file_registry$tot_c_cur, description = "Total current carbon", units = "Mg of C")
+  )
+  
+  if (!is.null(file_registry$fut_pools)) {
+    aggregate_results[[length(aggregate_results) + 1]] <- 
+      list(raster_uri = file_registry$tot_c_fut, description = "Total future carbon", units = "Mg of C")
+  }
+  if (!is.null(file_registry$redd_pools)) {
+    aggregate_results[[length(aggregate_results) + 1]] <- 
+      list(raster_uri = file_registry$tot_c_redd, description = "Total REDD carbon", units = "Mg of C")
+  }
+  if (!is.null(file_registry$delta_cur_fut)) {
+    aggregate_results[[length(aggregate_results) + 1]] <- 
+      list(raster_uri = file_registry$delta_cur_fut, description = "Change in carbon (cur to future)", units = "Mg of C")
+  }
+  if (!is.null(file_registry$delta_cur_redd)) {
+    aggregate_results[[length(aggregate_results) + 1]] <- 
+      list(raster_uri = file_registry$delta_cur_redd, description = "Change in carbon (cur to REDD)", units = "Mg of C")
+  }
+  if (!is.null(file_registry$valuation_cur)) {
+    aggregate_results[[length(aggregate_results) + 1]] <- 
+      list(raster_uri = file_registry$valuation_cur, description = "Valuation (current)", units = "currency units")
+  }
+  if (!is.null(file_registry$valuation_fut)) {
+    aggregate_results[[length(aggregate_results) + 1]] <- 
+      list(raster_uri = file_registry$valuation_fut, description = "Valuation (future)", units = "currency units")
+  }
+  if (!is.null(file_registry$valuation_redd)) {
+    aggregate_results[[length(aggregate_results) + 1]] <- 
+      list(raster_uri = file_registry$valuation_redd, description = "Valuation (REDD)", units = "currency units")
+  }
+  
+  cat(paste0("<tr><td>Valuation Constant</td><td class=\"number\">", format(valuation_constant, digits = 4), 
+             "</td><td>currency units</td><td>-</td></tr>\n"))
+  
+  for (item in aggregate_results) {
+    if (!is.null(item$raster_uri) && (item$raster_uri %in% raster_file_set)) {
+      summary_stat <- sum_raster(item$raster_uri)
+      cat(paste0("<tr><td>", item$description, "</td><td class=\"number\">",
+                 format(summary_stat, digits = 2), "</td><td>", item$units, 
+                 "</td><td>", item$raster_uri, "</td></tr>\n"))
+    }
+  }
+  cat("</tbody></table>\n")
+  
+  cat("<h2>Carbon Pool Intermediate Results (Current)</h2>\n<table><thead><tr><th>Pool</th><th>Output File</th><th>Sum</th></tr></thead><tbody>\n")
+  for (pool in names(file_registry$cur_pools)) {
+    out_file <- file_registry$cur_pools[[pool]]
+    pool_sum <- sum_raster(out_file)
+    cat(paste0("<tr><td>", toupper(pool), "</td><td>", out_file, "</td><td class=\"number\">", 
+               format(pool_sum, digits = 2), "</td></tr>\n"))
+  }
+  cat("</tbody></table>\n")
+  
+  if (!is.null(file_registry$fut_pools)) {
+    cat("<h2>Carbon Pool Intermediate Results (Future)</h2>\n<table><thead><tr><th>Pool</th><th>Output File</th><th>Sum</th></tr></thead><tbody>\n")
+    for (pool in names(file_registry$fut_pools)) {
+      out_file <- file_registry$fut_pools[[pool]]
+      pool_sum <- sum_raster(out_file)
+      cat(paste0("<tr><td>", toupper(pool), "</td><td>", out_file, "</td><td class=\"number\">", 
+                 format(pool_sum, digits = 2), "</td></tr>\n"))
+    }
+    cat("</tbody></table>\n")
+  }
+  
+  if (!is.null(file_registry$redd_pools)) {
+    cat("<h2>Carbon Pool Intermediate Results (REDD)</h2>\n<table><thead><tr><th>Pool</th><th>Output File</th><th>Sum</th></tr></thead><tbody>\n")
+    for (pool in names(file_registry$redd_pools)) {
+      out_file <- file_registry$redd_pools[[pool]]
+      pool_sum <- sum_raster(out_file)
+      cat(paste0("<tr><td>", toupper(pool), "</td><td>", out_file, "</td><td class=\"number\">", 
+                 format(pool_sum, digits = 2), "</td></tr>\n"))
+    }
+    cat("</tbody></table>\n")
+  }
+  
+  cat("</body></html>\n")
+  
+  sink()
+  close(con)
+}
+
+# تابع کمکی جهت یافتن فایل رستر در صورت عدم وجود در مسیر مورد انتظار
+find_raster_file <- function(expected_path) {
+  if (file.exists(expected_path)) {
+    return(expected_path)
+  } else {
+    message("فایل مورد انتظار در مسیر: ", expected_path, " یافت نشد. در حال جستجو در دایرکتوری...")
+    parent_dir <- dirname(expected_path)
+    base_pattern <- gsub("\\.tif$", "", basename(expected_path))
+    candidates <- list.files(parent_dir, pattern = base_pattern, full.names = TRUE)
+    if (length(candidates) > 0) {
+      message("فایل جایگزین پیدا شد: ", candidates[1])
+      return(candidates[1])
+    } else {
+      stop("فایل رستر برای: ", expected_path, " یافت نشد.")
+    }
+  }
+}
+
+# تابع برای رسم نقشه با پروفایل‌های بالا (ستونی) و راست (ردیفی)
+plot_raster_with_profiles <- function(file_path) {
+  # خواندن رستر با استفاده از terra و تبدیل به شیء raster (از بسته raster) 
+  r_terra <- rast(file_path)
+  r_obj <- raster(r_terra)
+  
+  # استخراج ماتریس مقادیر برای محاسبه پروفایل‌ها
+  m <- as.matrix(r_obj)
+  
+  # رسم نقشه اصلی با levelplot از بسته rasterVis
+  main_plot <- levelplot(r_obj, margin = FALSE, 
+                         col.regions = terrain.colors(100),
+                         main = paste("Map:", basename(file_path)))
+  
+  # محاسبه پروفایل ستونی (میانگین مقادیر هر ستون)
+  x_profile <- colMeans(m, na.rm = TRUE)
+  top_plot <- xyplot(x_profile ~ seq_along(x_profile), type = "l",
+                     scales = list(x = list(draw = FALSE)),
+                     xlab = NULL, ylab = "Col Mean",
+                     par.settings = list(superpose.line = list(col = "blue")),
+                     panel = function(x, y, ...) {
+                       panel.xyplot(x, y, ...)
+                     })
+  
+  # محاسبه پروفایل ردیفی (میانگین مقادیر هر ردیف)
+  y_profile <- rowMeans(m, na.rm = TRUE)
+  right_plot <- xyplot(seq_along(y_profile) ~ y_profile, type = "l",
+                       scales = list(y = list(draw = FALSE)),
+                       xlab = "Row Mean", ylab = NULL,
+                       par.settings = list(superpose.line = list(col = "blue")),
+                       panel = function(x, y, ...) {
+                         panel.xyplot(x, y, ...)
+                       })
+  
+  # ترکیب نمودارها: بالای نقشه، پروفایل ستونی؛ سمت راست، پروفایل ردیفی.
+  combined <- grid.arrange(
+    top_plot, grid::nullGrob(),
+    main_plot, right_plot,
+    ncol = 2, nrow = 2,
+    widths = c(4, 1), heights = c(1, 4)
+  )
+  return(combined)
+}
+
+# رابط کاربری Shiny
+ui <- fluidPage(
+  titlePanel("InVEST Carbon Model"),
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("lulc_cur_path", "Current LULC Raster"),
+      fileInput("lulc_fut_path", "Future LULC Raster (Optional)"),
+      fileInput("lulc_redd_path", "REDD LULC Raster (Optional)"),
+      fileInput("carbon_pools_path", "Carbon Pools CSV"),
+      numericInput("lulc_cur_year", "Current LULC Year", value = 2020),
+      numericInput("lulc_fut_year", "Future LULC Year", value = 2030),
+      numericInput("price_per_metric_ton_of_c", "Price per Metric Ton of C", value = 10),
+      numericInput("discount_rate", "Discount Rate (%)", value = 5),
+      numericInput("rate_change", "Rate Change (%)", value = 2),
+      shinyDirButton("workspace_dir", "Workspace Directory", "Select a folder"),
+      verbatimTextOutput("dirpath"),
+      textInput("result_suffix", "Result Suffix (optional)", value = ""),
+      actionButton("run_model", "Run Model")
+    ),
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Report",
+                 uiOutput("report_html")
+        ),
+        tabPanel("Map Album",
+                 fluidRow(
+                   column(2, actionButton("prev_map", "Previous")),
+                   column(8, h4(textOutput("map_caption"), align = "center")),
+                   column(2, actionButton("next_map", "Next"))
+                 ),
+                 plotOutput("map_album", height = "600px")
+        )
+      )
+    )
+  )
+)
+
+# کد سرور Shiny
+server <- function(input, output, session) {
+  options(shiny.maxRequestSize = 230 * 1024^2)
+  
+  roots <- c(home = normalizePath("~"))
+  shinyDirChoose(input, "workspace_dir", roots = roots)
+  
+  output$dirpath <- renderPrint({
+    req(input$workspace_dir)
+    parseDirPath(roots, input$workspace_dir)
+  })
+  
+  # تعریف متغیرهای واکنشی جهت آلبوم نقشه‌ها
+  rv <- reactiveValues(mapList = NULL)
+  currentMapIndex <- reactiveVal(1)
+  
+  # رویداد تغییر دکمه‌های آلبوم
+  observeEvent(input$prev_map, {
+    req(rv$mapList)
+    newIndex <- currentMapIndex() - 1
+    if(newIndex < 1) newIndex <- length(rv$mapList)
+    currentMapIndex(newIndex)
+  })
+  
+  observeEvent(input$next_map, {
+    req(rv$mapList)
+    newIndex <- currentMapIndex() + 1
+    if(newIndex > length(rv$mapList)) newIndex <- 1
+    currentMapIndex(newIndex)
+  })
+  
+  # نمایش عنوان/کپشن نقشه جاری
+  output$map_caption <- renderText({
+    req(rv$mapList)
+    req(currentMapIndex())
+    idx <- currentMapIndex()
+    paste("Map", idx, "of", length(rv$mapList), ":", basename(rv$mapList[[idx]]))
+  })
+  
+  # نمایش نقشه فعلی با استفاده از تابع plot_raster_with_profiles
+  output$map_album <- renderPlot({
+    req(rv$mapList)
+    req(currentMapIndex())
+    currentFile <- rv$mapList[[currentMapIndex()]]
+    plot_raster_with_profiles(currentFile)
+  })
+  
+  observeEvent(input$run_model, {
+    if (is.null(input$carbon_pools_path)) {
+      showNotification("Please select a Carbon Pools CSV file.", type = "error")
+      return()
+    }
+    
+    # خواندن ورودی‌های اصلی
+    lulc_cur <- input$lulc_cur_path$datapath
+    carbon_pools <- tryCatch({
+      read.csv(input$carbon_pools_path$datapath)
+    }, error = function(e) {
+      showNotification("Error reading Carbon Pools CSV file.", type = "error")
+      return(NULL)
+    })
+    if (is.null(carbon_pools)) return()
+    
+    workspace_dir <- parseDirPath(roots, input$workspace_dir)
+    if (length(workspace_dir) == 0 || workspace_dir == "") {
+      showNotification("Please select a valid workspace directory.", type = "error")
+      return()
+    }
+    
+    result_suffix <- input$result_suffix
+    if (result_suffix != "" && !grepl("^_", result_suffix)) {
+      result_suffix <- paste0("_", result_suffix)
+    }
+    
+    file_ext <- ".tif"
+    file_registry <- list()
+    
+    ## پردازش LULC Current
+    cur_base <- file.path(workspace_dir, "carbon_cur")
+    cur_intermediate <- file.path(cur_base, "intermediate_outputs")
+    if (!dir.exists(cur_intermediate)) { 
+      dir.create(cur_intermediate, recursive = TRUE) 
+    }
+    cur_pools <- generate_carbon_pool_maps(lulc_cur, carbon_pools, cur_base, cur_intermediate, result_suffix, file_ext)
+    file_registry$cur_pools <- cur_pools
+    file_registry$tot_c_cur <- cur_pools$total
+    
+    # ارزشگذاری وضع موجود (Current Valuation)
+    valuation_cur_file <- file.path(workspace_dir, paste0("valuation_cur", result_suffix, file_ext))
+    calculate_valuation(file_registry$tot_c_cur, input$price_per_metric_ton_of_c, valuation_cur_file)
+    file_registry$valuation_cur <- valuation_cur_file
+    
+    ## پردازش LULC Future (اختیاری)
+    if (!is.null(input$lulc_fut_path)) {
+      lulc_fut <- input$lulc_fut_path$datapath
+      fut_base <- file.path(workspace_dir, "carbon_fut")
+      fut_intermediate <- file.path(fut_base, "intermediate_outputs")
+      if (!dir.exists(fut_intermediate)) { 
+        dir.create(fut_intermediate, recursive = TRUE) 
+      }
+      fut_pools <- generate_carbon_pool_maps(lulc_fut, carbon_pools, fut_base, fut_intermediate, result_suffix, file_ext)
+      file_registry$fut_pools <- fut_pools
+      file_registry$tot_c_fut <- fut_pools$total
+      
+      # دریافت و اعتبارسنجی رسترهای current و future
+      cur_file <- find_raster_file(file_registry$tot_c_cur)
+      fut_file <- find_raster_file(file_registry$tot_c_fut)
+      
+      cur_raster <- rast(cur_file)
+      fut_raster <- rast(fut_file)
+      
+      if (all(is.na(values(cur_raster)))) {
+        showNotification("Current total raster has no valid values!", type = "error")
+        return()
+      }
+      if (all(is.na(values(fut_raster)))) {
+        showNotification("Future total raster has no valid values!", type = "error")
+        return()
+      }
+      
+      fut_resampled <- resample(fut_raster, cur_raster, method = "bilinear")
+      delta_raster_fut <- fut_resampled - cur_raster
+      delta_fut_file <- file.path(workspace_dir, paste0("delta_cur_fut", result_suffix, file_ext))
+      writeRaster(delta_raster_fut, filename = delta_fut_file, overwrite = TRUE, datatype = "FLT4S")
+      file_registry$delta_cur_fut <- delta_fut_file
+      
+      valuation_fut_file <- file.path(workspace_dir, paste0("valuation_fut", result_suffix, file_ext))
+      calc_val_const <- calculate_valuation_constant(input$lulc_cur_year, input$lulc_fut_year, 
+                                                     input$discount_rate, input$rate_change, 
+                                                     input$price_per_metric_ton_of_c)
+      calculate_valuation(file_registry$tot_c_fut, calc_val_const, valuation_fut_file)
+      file_registry$valuation_fut <- valuation_fut_file
+    }
+    
+    ## پردازش LULC REDD (اختیاری)
+    if (!is.null(input$lulc_redd_path)) {
+      lulc_redd <- input$lulc_redd_path$datapath
+      redd_base <- file.path(workspace_dir, "carbon_redd")
+      redd_intermediate <- file.path(redd_base, "intermediate_outputs")
+      if (!dir.exists(redd_intermediate)) { 
+        dir.create(redd_intermediate, recursive = TRUE) 
+      }
+      redd_pools <- generate_carbon_pool_maps(lulc_redd, carbon_pools, redd_base, redd_intermediate, result_suffix, file_ext)
+      file_registry$redd_pools <- redd_pools
+      file_registry$tot_c_redd <- redd_pools$total
+      
+      cur_file <- find_raster_file(file_registry$tot_c_cur)
+      redd_file <- find_raster_file(file_registry$tot_c_redd)
+      
+      cur_raster <- rast(cur_file)
+      redd_raster <- rast(redd_file)
+      
+      if (all(is.na(values(cur_raster)))) {
+        showNotification("Current total raster has no valid values!", type = "error")
+        return()
+      }
+      if (all(is.na(values(redd_raster)))) {
+        showNotification("REDD total raster has no valid values!", type = "error")
+        return()
+      }
+      
+      redd_resampled <- resample(redd_raster, cur_raster, method = "bilinear")
+      delta_raster_redd <- redd_resampled - cur_raster
+      delta_redd_file <- file.path(workspace_dir, paste0("delta_cur_redd", result_suffix, file_ext))
+      writeRaster(delta_raster_redd, filename = delta_redd_file, overwrite = TRUE, datatype = "FLT4S")
+      file_registry$delta_cur_redd <- delta_redd_file
+      
+      valuation_redd_file <- file.path(workspace_dir, paste0("valuation_redd", result_suffix, file_ext))
+      calculate_valuation(file_registry$tot_c_redd,
+                          calculate_valuation_constant(input$lulc_cur_year, input$lulc_fut_year, 
+                                                       input$discount_rate, input$rate_change, 
+                                                       input$price_per_metric_ton_of_c),
+                          valuation_redd_file)
+      file_registry$valuation_redd <- valuation_redd_file
+    }
+    
+    raster_file_set <- c(file_registry$tot_c_cur,
+                         file_registry$tot_c_fut,
+                         file_registry$tot_c_redd,
+                         file_registry$delta_cur_fut,
+                         file_registry$delta_cur_redd,
+                         file_registry$valuation_cur,
+                         file_registry$valuation_fut,
+                         file_registry$valuation_redd)
+    
+    #############################
+    ## محاسبه واریانس و اطمینان بر مبنای تغییرات کاربری:
+    ##
+    ## 1. برای هر کاربری (مخزن) کربن فعلی، واریانس مجزا محاسبه و ذخیره می‌شود.
+    ## 2. در صورت موجود بودن کربن آینده، به ازای هر کاربری واریانس وضعیت آینده هم جداگانه محاسبه می‌شود.
+    ## 3. محاسبه اطمینان: برای هر کاربری اختلاف (future - current) محاسبه شده و سپس این تغییرات در یک stack قرار می‌گیرند.
+    ##    سپس با استفاده از یک wrapper به تابع calculate_confidence مقدار آستانه (مثلاً 0.5) ارسال می‌شود.
+    #############################
+    pool_names <- c("above", "below", "soil", "dead")
+    
+    # 1. واریانس کربن فعلی برای هر کاربری
+    for (pool in pool_names) {
+      cur_pool_raster <- rast(file_registry$cur_pools[[pool]])
+      var_cur <- app(cur_pool_raster, fun = calc_variance)
+      var_cur_path <- file.path(workspace_dir, paste0("variance_cur_", pool, result_suffix, file_ext))
+      writeRaster(var_cur, var_cur_path, overwrite = TRUE)
+      cat(paste("Variance output (current", pool, ") saved to:", var_cur_path, "\n"))
+    }
+    
+    # 2. برای کاربری‌های موجود در کربن آینده
+    if (!is.null(file_registry$fut_pools)) {
+      for (pool in pool_names) {
+        fut_pool_raster <- rast(file_registry$fut_pools[[pool]])
+        var_fut <- app(fut_pool_raster, fun = calc_variance)
+        var_fut_path <- file.path(workspace_dir, paste0("variance_fut_", pool, result_suffix, file_ext))
+        writeRaster(var_fut, var_fut_path, overwrite = TRUE)
+        cat(paste("Variance output (future", pool, ") saved to:", var_fut_path, "\n"))
+      }
+      
+      # 3. محاسبه اطمینان: ابتدا اختلاف به ازای هر کاربری مشخص می‌شود و سپس یک stack از این اختلاف‌ها ساخته می‌شود.
+      diff_list <- list()
+      for (pool in pool_names) {
+        fut_pool_raster <- rast(file_registry$fut_pools[[pool]])
+        cur_pool_raster <- rast(file_registry$cur_pools[[pool]])
+        diff_raster <- fut_pool_raster - cur_pool_raster
+        diff_list[[pool]] <- diff_raster
+      }
+      diff_stack <- rast(diff_list)
+      # استفاده از wrapper برای فراخوانی calculate_confidence به همراه مقدار آستانه (conf_limit = 0.5)
+      conf_c <- app(diff_stack, fun = function(x) { calculate_confidence(x, conf_limit = 0.5) },
+                    filename = file.path(workspace_dir, paste0("conf_c", result_suffix, file_ext)),
+                    overwrite = TRUE, datatype = 'INT1S')
+      cat(paste("Confidence output (conf_c) saved to:", file.path(workspace_dir, paste0("conf_c", result_suffix, file_ext)), "\n"))
+    }
+    #############################
+    
+    html_report_path <- file.path(workspace_dir, paste0("carbon_report", result_suffix, ".html"))
+    file_registry$html_report <- html_report_path
+    
+    val_const <- calculate_valuation_constant(input$lulc_cur_year, input$lulc_fut_year, 
+                                              input$discount_rate, input$rate_change, 
+                                              input$price_per_metric_ton_of_c)
+    
+    generate_report(raster_file_set, model_args = list(
+      lulc_cur_path = lulc_cur,
+      carbon_pools_path = input$carbon_pools_path$datapath,
+      lulc_cur_year = input$lulc_cur_year,
+      lulc_fut_year = input$lulc_fut_year,
+      price_per_metric_ton_of_c = input$price_per_metric_ton_of_c,
+      discount_rate = input$discount_rate,
+      rate_change = input$rate_change,
+      workspace_dir = as.character(workspace_dir),
+      result_suffix = result_suffix
+    ), file_registry, valuation_constant = val_const)
+    
+    # به‌روزرسانی لیست نقشه‌ها برای آلبوم
+    rv$mapList <- Filter(function(x) !is.null(x) && x != "", raster_file_set)
+    currentMapIndex(1)
+    
+    html_content <- readChar(html_report_path, file.info(html_report_path)$size)
+    output$report_html <- renderUI({
+      tags$iframe(srcdoc = html_content, style = "width:100%; height:800px; border:0;")
+    })
+    
+  })
+}
+
+# اجرای برنامه Shiny
+shinyApp(ui = ui, server = server)
+
+
